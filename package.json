@@ -1,0 +1,13 @@
+{
+  "name": "private-vod-aggregator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "零依赖的私人影视聚合站：静态前端 + Vercel Serverless 同源代理",
+  "scripts": {
+    "dev": "npx vercel dev",
+    "smoke": "node scripts/smoke-test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
