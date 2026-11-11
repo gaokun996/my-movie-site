@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>私人影视聚合播放器</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #121212; color: #fff; padding: 20px; }
+    .container { max-width: 900px; margin: 0 auto; }
+    h1 { text-align: center; margin-bottom: 20px; color: #4facfe; }
+    .controls { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }
+    select, input, button { padding: 10px 14px; border-radius: 6px; border: none; font-size: 14px; outline: none; }
+    select { background: #2a2a2a; color: #fff; flex: 1; min-width: 150px; }
+    input { background: #2a2a2a; color: #fff; flex: 2; min-width: 200px; }
+    button { background: #4facfe; color: #fff; cursor: pointer; transition: 0.2s; }
+    button:hover { background: #00f2fe; }
+    .player-box { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 8px; overflow: hidden; margin-bottom: 20px; }
+    video { width: 100%; height: 100%; }
+    .results { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 15px; }
+    .card { background: #2a2a2a; border-radius: 6px; padding: 10px; cursor: pointer; text-align: center; font-size: 13px; }
+    .card:hover { background: #3a3a3a; color: #4facfe; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🎬 私人影视影音库</h1>
+    <div class="controls">
+      <select id="apiSelect">
+        <option value="https://cj.lziapi.com/api.php/provide/vod/">量子资源</option>
+        <option value="https://cj.ffzyapi.com/api.php/provide/vod/">非凡资源</option>
+        <option value="https://jszyapi.com/api.php/provide/vod/">极速资源</option>
+        <option value="https://api.wujinapi.me/api.php/provide/vod/">无尽资源</option>
+        <option value="https://bfzyapi.com/api.php/provide/vod/">暴风资源</option>
+      </select>
+      <input type="text" id="keyword" placeholder="输入你想看的电影/电视剧名称...">
+      <button onclick="searchVod()">搜索影片</button>
+    </div>
+    
+    <div class="player-box">
+      <video id="videoPlayer" controls></video>
+    </div>
+
+    <div class="results" id="results"></div>
+  </div>
+
+  <script>
+    let hls = null;
+
+    async function searchVod() {
+      const api = document.getElementById('apiSelect').value;
+      const kw = document.getElementById('keyword').value.trim();
+      const resultsDiv = document.getElementById('results');
+      if (!kw) return alert('请输入搜索关键词！');
+
+      resultsDiv.innerHTML = '<p style="grid-column: 1/-1; text-align:center;">正在检索资源，请稍候...</p>';
+
+      try {
+        const res = await fetch(`${api}?ac=detail&wd=${encodeURIComponent(kw)}`);
+        const data = await res.json();
+        
+        resultsDiv.innerHTML = '';
+        if (!data.list || data.list.length === 0) {
+          resultsDiv.innerHTML = '<p style="grid-column: 1/-1; text-align:center;">未搜索到相关资源，请尝试更换上方接口。</p>';
+          return;
+        }
+
+        data.list.forEach(item => {
+          const card = document.createElement('div');
+          card.className = 'card';
+          card.innerText = item.vod_name;
+          card.onclick = () => playVod(item);
+          resultsDiv.appendChild(card);
+        });
+      } catch (e) {
+        resultsDiv.innerHTML = '<p style="grid-column: 1/-1; text-align:center;">接口响应失败，请切换选框中的其他资源接口尝试。</p>';
+      }
+    }
+
+    function playVod(item) {
+      const video = document.getElementById('videoPlayer');
+      // 解析 vod_play_url 提取第一个 m3u8 地址
+      const playUrlData = item.vod_play_url || '';
+      const m3u8Match = playUrlData.match(/https?:\/\/[^\s$#]+\.m3u8/);
+
+      if (!m3u8Match) {
+        alert('未提取到可用的 M3U8 播放链接');
+        return;
+      }
+
+      const videoUrl = m3u8Match[0];
+
+      if (Hls.isSupported()) {
+        if (hls) hls.destroy();
+        hls = new Hls();
+        hls.loadSource(videoUrl);
+        hls.attachMedia(video);
+        hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = videoUrl;
+        video.play();
+      }
+    }
+  </script>
+</body>
+</html>
