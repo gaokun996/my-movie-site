@@ -10,7 +10,7 @@
 
 const http = require('http');
 const assert = require('assert');
-const { parsePlayUrl, normalizeResponse } = require('../lib/vod-format');
+const { parsePlayUrl, normalizeItem, normalizeResponse } = require('../lib/vod-format');
 const vodHandler = require('../api/vod');
 const sourcesHandler = require('../api/sources');
 
@@ -103,14 +103,56 @@ function setBase(path) {
     const n = normalizeResponse([{ vod_name: 'X' }]);
     assert.strictEqual(n.list.length, 1);
   });
+  check('详情弹框字段：导演 / 主演 / 标签来源', () => {
+    const n = normalizeItem({
+      vod_name: 'X', vod_director: '张三', vod_actor: '李四',
+      vod_remarks: 'HD国语', vod_class: '动作片', vod_year: '2026', vod_area: '大陆',
+    });
+    assert.strictEqual(n.vod_director, '张三');
+    assert.strictEqual(n.vod_actor, '李四');
+    assert.deepStrictEqual(
+      [n.vod_remarks, n.vod_class, n.vod_year, n.vod_area],
+      ['HD国语', '动作片', '2026', '大陆'], '应能拼出参考截图里的 4 个标签');
+  });
 
-  console.log('\n[3] 配置缺失分支');
-  await checkAsync('未配置数据源 → NO_SOURCE（不再伪装成"切换接口"）', async () => {
-    delete process.env.VOD_API_BASE; delete process.env.VOD_SOURCES_JSON;
+  console.log('\n[3] 零配置演示模式');
+  const clearEnv = () => { delete process.env.VOD_API_BASE; delete process.env.VOD_SOURCES_JSON; };
+  await checkAsync('未配置任何环境变量 → 自动回退演示数据（不再是 NO_SOURCE）', async () => {
+    clearEnv();
     const r = await call(vodHandler, '/api/vod?ac=videolist');
-    assert.strictEqual(r.body.ok, false);
-    assert.strictEqual(r.body.code, 'NO_SOURCE');
-    assert.strictEqual(r.body.stage, 'config');
+    assert.strictEqual(r.body.ok, true, '零配置也必须能跑通');
+    assert.strictEqual(r.body.demo, true);
+    assert.strictEqual(r.body.list.length, 3, '每页 3 条');
+    assert.ok(r.body.pagecount >= 2, '至少 2 页');
+    assert.ok(r.body.list[0].play_sources.length >= 1, '要有可播放线路');
+    assert.ok(r.body.list[0].play_sources[0].episodes[0].url.startsWith('https://'));
+    assert.ok(r.body.list[0].vod_director, '演示条目也要有导演，详情弹框才能显示演职员行');
+  });
+  await checkAsync('演示模式：分类 / 搜索 / 分页 / 多线路 / HLS 多集', async () => {
+    clearEnv();
+    const cls = await call(vodHandler, '/api/vod?ac=class');
+    assert.strictEqual(cls.body.classes.length, 3);
+
+    const p2 = await call(vodHandler, '/api/vod?ac=videolist&pg=2');
+    assert.strictEqual(p2.body.page, 2);
+    assert.notStrictEqual(p2.body.list[0].vod_id, 'demo-1', '第 2 页不能和第 1 页重复');
+
+    const kw = await call(vodHandler, '/api/vod?ac=videolist&wd=' + encodeURIComponent('多码率'));
+    assert.ok(kw.body.list.length >= 1, '关键词应命中');
+    const hlsItem = kw.body.list[0];
+    assert.strictEqual(hlsItem.play_sources.length, 2, '应有 2 条线路');
+    assert.ok(hlsItem.play_sources[1].episodes[1].url.includes('bipbop_16x9'), 'HLS 多集应被解析');
+
+    const filtered = await call(vodHandler, '/api/vod?ac=videolist&t=3');
+    assert.ok(filtered.body.list.every((i) => i.vod_id.startsWith('demo-')), '分类筛选应生效');
+  });
+  await checkAsync('配置写错时回退演示数据，并在名称里给出警告', async () => {
+    clearEnv();
+    process.env.VOD_SOURCES_JSON = '{ this is not json';
+    const r = await call(sourcesHandler, '/api/sources');
+    assert.strictEqual(r.body.length, 1);
+    assert.ok(r.body[0].name.includes('不是合法 JSON'), '用户要能看见配置写错了');
+    clearEnv();
   });
   await checkAsync('/api/sources 不暴露上游地址', async () => {
     setBase('/ok/api.php/provide/vod/');
