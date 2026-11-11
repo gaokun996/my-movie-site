@@ -47,7 +47,8 @@
 ├── api/
 │   ├── vod.js                 核心 Serverless 代理（元数据 JSON）
 │   ├── sources.js             数据源下拉列表（不暴露上游地址）
-│   └── playlist.js            M3U8 播放清单同源代理（只几 KB 文本）
+│   ├── playlist.js            M3U8 播放清单同源代理（只几 KB 文本）
+│   └── fragment.js            .ts / .m4s / KEY 分片同源代理（v6）
 ├── lib/
 │   ├── vod-format.js          播放地址与返回数据标准化
 │   ├── sources.js             数据源配置读取
@@ -262,3 +263,65 @@ README.md
 ```
 
 `lib/` 与 `api/vod.js`、`api/sources.js` 未改动。上传后 Vercel 会自动把 `api/playlist.js` 识别成新 Function，**不需要改环境变量、不需要 Redeploy 之外额外操作**。本地 `node scripts/smoke-test.js` 19 项全通过，前端 45 个 DOM id 与引用一一对应。
+
+## 十一、v6：更正归因 + 四种播放模式
+
+### 先更正 v5 的一处误判
+
+v5 的诊断文案把 `fragLoadError` 一律归到「防盗链」，**这个归因不准确**。真实观测是：
+
+> 页面里一直缓冲 / `fragLoadError`，但「新标签打开」同一个 M3U8 **可以播放**。
+
+这组现象恰恰说明**不是防盗链，是视频分片缺 CORS 头**。原理：
+
+- 浏览器**顶层导航**打开 M3U8，以及 `<video src>` 加载媒体，走 `no-cors` 媒体加载，**不需要 `Access-Control-Allow-Origin`**；
+- HLS.js 在页面里用 **XHR/fetch** 取 `.ts` / `.m4s`，是标准跨域请求，上游不给 CORS 头就被静默丢弃 —— 表现正是「清单拿到了、一直转圈、没有画面」。
+
+同一个 IP、同一个 URL，差别只在请求方式。若是 IP 绑定防盗链，新标签也会一起失败；若是 token 过期，两边都会失败。所以「新标签能播」是 CORS 的强证据。
+
+v5 把清单里的相对分片**重写成上游绝对地址**（本意是防代理后基准地址变化导致 404），代价是把分片请求又推回跨域直连，于是这层问题暴露得更明显 —— 这是设计取舍，不是配置错误。
+
+### v6 四档播放模式（诊断条里可实时切换）
+
+| 模式 | 做法 | 适用 |
+|---|---|---|
+| **① 原生直连**（默认，推荐先试） | `video.src = 原始 M3U8`，与「新标签打开」同一路径，走 no-cors | 浏览器原生支持 HLS（Safari / 部分 Edge / 装了 HLS 扩展）。**零函数开销、零带宽消耗** |
+| **② 清单+分片全代理** | 清单与所有分片 / 子清单 / KEY 都改写成同源 `/api/...` | 浏览器不支持原生 HLS 时，让 HLS.js 全程同源，CORS 彻底消失 |
+| **③ 仅清单代理**（v5 行为） | 清单走同源，分片仍是上游绝对地址 | 分片本身带 CORS 头的源 |
+| **④ 全部直连** | 完全不代理 | 对照测试用 |
+
+`/api/playlist?proxyFrag=1` 会把清单里每一行 URI 重写：分片 → `/api/fragment?url=...`，子清单 → 递归 `/api/playlist?proxyFrag=1&url=...`，`#EXT-X-KEY` 的 `URI` 同样处理。用**根相对路径**，避免相对 `/api/playlist` 被解析成 `/api/api/...`。
+
+`/api/fragment.js` 只转发单个分片二进制，带 CORS 头、按扩展名设 Content-Type、`Cache-Control: private`（带时效 token 的分片绝不进共享缓存）；同样拒绝内网、可选 `PLAYLIST_HOST_ALLOWLIST` 域名白名单、不伪造 Referer。
+
+### 全代理模式的真实限制（必须知道）
+
+- **Vercel Hobby 函数响应有体积上限**：这里设 4MB 软上限，高清大分片会返回 `FRAGMENT_TOO_LARGE` 并提示换低清晰度线路或切回原生直连；
+- **免费约 100GB/月带宽**：全代理分片是实打实过 Vercel 流量，1 小时 2Mbps 约 900MB，看百来集就到顶；
+- **函数 10 秒上限**、每次分片一次调用，冷启动会拖慢起播。
+
+所以 ② 是「让 CORS 类故障能播起来」的**诊断 / 过渡方案**，不是长期流媒体分发方案。真正长期稳定可播，仍要靠合法授权接入或自有/公有领域片源。
+
+### 怎么读结果
+
+| 现象 | 结论 |
+|---|---|
+| ① 直接出画面 | ✅ 就是 CORS，且浏览器原生支持 HLS —— **最优解，零成本** |
+| ② 走到「③ 分片已加载」 | ✅ CORS 已由同源代理消除 |
+| ② 报 `FRAGMENT_TOO_LARGE` | 平台响应上限，换低清晰度线路或回 ① |
+| ② 报 `FRAGMENT_403` | 清单 CORS 已解决，剩下的才是真防盗链 / 授权层，需接口方给你的域名授权 |
+| ① 报「浏览器不支持原生 HLS」 | 切 ② |
+
+**不做的事**：不伪造 Referer、不破解 token、不绕过 IP 绑定。CORS 是浏览器同源策略，同源转发是标准解法；防盗链是授权校验，绕过它既不稳定也不合规。
+
+### v6 覆盖清单
+
+```
+api/playlist.js        ← 支持 proxyFrag=1，新增 absolutizeProxied
+api/fragment.js        ← 新增（必须传）
+index.html             ← 四档模式 + 修正后的诊断文案
+scripts/smoke-test.js  ← 新增 6 项（现共 25 项）
+README.md
+```
+
+`lib/`、`api/vod.js`、`api/sources.js` 与环境变量都不用动。本地 `node scripts/smoke-test.js` **25 项全通过**，前端 45 个 DOM id 与引用一一对应。

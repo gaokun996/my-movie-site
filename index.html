@@ -298,9 +298,11 @@
             <span class="diag-url" id="diagUrl" title="">—</span>
           </div>
           <div class="diag-row">
-            <span class="diag-label">取清单方式</span>
-            <label class="radio"><input type="radio" name="fetchMode" value="proxy" checked> 同源代理（推荐，解决 CORS）</label>
-            <label class="radio"><input type="radio" name="fetchMode" value="direct"> 浏览器直连</label>
+            <span class="diag-label">播放模式</span>
+            <label class="radio"><input type="radio" name="fetchMode" value="native" checked> ① 原生直连（推荐先试）</label>
+            <label class="radio"><input type="radio" name="fetchMode" value="all"> ② 清单+分片全代理</label>
+            <label class="radio"><input type="radio" name="fetchMode" value="proxy"> ③ 仅清单代理</label>
+            <label class="radio"><input type="radio" name="fetchMode" value="direct"> ④ 全部直连</label>
           </div>
           <div class="diag-acts">
             <button class="mini" id="diagCopy">复制地址</button>
@@ -360,7 +362,7 @@
   const state = {
     source:'', sourceName:'', sources:[], cls:'', kw:'', pg:1,
     pagecount:1, total:0, items:[], sort:'default', current:null, lineIndex:0,
-    skipDone:false, lastPlay:null, viaProxy:true, fragOk:false
+    skipDone:false, lastPlay:null, mode:'native', fragOk:false
   };
   let hls = null, hlsPromise = null;
 
@@ -582,13 +584,15 @@
     v.addEventListener('timeupdate', v._skipHandler);
   }
 
-  function proxyUrlOf(raw) { return '/api/playlist?url=' + encodeURIComponent(raw); }
+  function proxyUrlOf(raw, all) {
+    return '/api/playlist?' + (all ? 'proxyFrag=1&' : '') + 'url=' + encodeURIComponent(raw);
+  }
 
   /** 读回 /api/playlist 的结构化错误，给出比 HLS.js 原生报错更准的原因 */
-  async function diagnoseProxy() {
-    if (!state.lastPlay || !state.viaProxy) return '';
+  async function diagnoseProxy(url) {
+    if (!url) return '';
     try {
-      const r = await fetch(proxyUrlOf(state.lastPlay.url), { headers:{ Accept:'application/json' } });
+      const r = await fetch(url, { headers:{ Accept:'application/json' } });
       const ct = r.headers.get('content-type') || '';
       if (!ct.includes('json')) return '';
       const d = await r.json();
@@ -618,8 +622,12 @@
       hint = '取 #EXT-X-KEY 密钥失败，该流有加密鉴权，同源代理清单无法提供凭证。';
     } else if (/level|frag|load/i.test(type + det)) {
       layer = '③ 视频分片层';
-      hint = '清单拿到了，但 .ts / .m4s 分片被拒绝。常见于防盗链：Referer 白名单、' +
-             'IP 绑定、token 时效。这一层在纯前端零成本架构里无法稳定绕过。';
+      hint = '清单拿到了，但 .ts / .m4s 分片没加载成功。' +
+             '最常见原因是上游分片没返回 Access-Control-Allow-Origin —— ' +
+             'HLS.js 用 XHR 跨域取分片会被浏览器静默拦掉，而新标签/<video src> 走 no-cors 不需要这个头，' +
+             '所以「新标签能播、页面里转圈」正是它的典型特征。' +
+             '切到「② 清单+分片全代理」让分片也走同源即可；' +
+             '若全代理仍 403，才是防盗链（Referer / IP / token）需要授权。';
     } else {
       layer = '播放层'; hint = extra || '视频流不可达或格式不受支持。';
     }
@@ -630,22 +638,45 @@
     const p = state.lastPlay;
     if (!p) return;
     const v = $('video'), msg = $('playmsg');
-    state.viaProxy = document.querySelector('input[name="fetchMode"]:checked').value === 'proxy';
+    const mode = (document.querySelector('input[name="fetchMode"]:checked') || {}).value || 'native';
+    state.mode = mode;
     state.fragOk = false;
     destroyHls();
+    v.onerror = null;
+    v.onloadedmetadata = null;
     bindSkipToast(v);
     v.load();
 
     const isM3u8 = /\.m3u8(\?|$)/i.test(p.url);
-    const loadUrl = (isM3u8 && state.viaProxy) ? proxyUrlOf(p.url) : p.url;
-    msg.textContent = `正在加载：${p.epName} …${isM3u8 ? (state.viaProxy ? '（清单走同源代理）' : '（清单直连）') : '（直链视频）'}`;
-
     if (!isM3u8) {
       v.src = p.url;
       v.play().catch(() => { msg.textContent = '已载入，点击播放按钮开始。'; });
-      msg.textContent = `播放中：${p.epName}（直链）`;
+      msg.textContent = `播放中：${p.epName}（直链视频，不经过 HLS.js）`;
       return;
     }
+
+    // ① 原生直连：<video src> 走 no-cors 媒体加载，和「新标签打开」同一条路径，
+    //    上游不给 CORS 头也照样能播。零函数开销、零带宽消耗，优先试。
+    if (mode === 'native') {
+      v.onerror = () => {
+        if (state.mode !== 'native') return;
+        msg.textContent = '原生直连失败：当前浏览器不支持原生 HLS。' +
+          '请切到「② 清单+分片全代理」（让分片也走同源），或「③ 仅清单代理」。';
+      };
+      v.onloadedmetadata = () => {
+        if (state.mode === 'native') msg.textContent = `播放中：${p.epName}（原生直连，无代理）`;
+      };
+      v.src = p.url;
+      v.play().catch(() => { msg.textContent += ' 已载入，点击播放按钮开始。'; });
+      msg.textContent = `正在加载：${p.epName} …（原生直连，与「新标签打开」同一路径）`;
+      return;
+    }
+
+    const all = mode === 'all';
+    const viaProxy = all || mode === 'proxy';
+    const loadUrl = viaProxy ? proxyUrlOf(p.url, all) : p.url;
+    const modeLabel = all ? '清单+分片全走同源代理' : (viaProxy ? '仅清单走代理，分片直连' : '全部直连');
+    msg.textContent = `正在加载：${p.epName} …（${modeLabel}）`;
 
     const ok = await loadHls();
     if (ok && window.Hls && window.Hls.isSupported()) {
@@ -662,7 +693,7 @@
       });
       hls.on(H.Events.MANIFEST_PARSED, (_e, data) => {
         const n = (data && data.levels && data.levels.length) || 1;
-        msg.textContent = `② 清单就绪（${n} 个清晰度），正在取视频分片…`;
+        msg.textContent = `② 清单就绪（${n} 个清晰度），正在取视频分片…${all ? '（分片走同源代理）' : ''}`;
         v.play().catch(() => { msg.textContent += ' 已就绪，点击播放按钮开始。'; });
       });
       hls.on(H.Events.FRAG_LOADED, () => {
@@ -671,7 +702,7 @@
       hls.on(H.Events.ERROR, async (_e, data) => {
         const fatal = data && data.fatal;
         if (!fatal) return;
-        const extra = await diagnoseProxy();
+        const extra = await diagnoseProxy(viaProxy ? loadUrl : '');
         msg.textContent = hlsErrorText(data, extra);
         try { hls.destroy(); } catch (e) {}
         hls = null;
@@ -683,7 +714,8 @@
       v.src = loadUrl; v.play().catch(() => {});
       msg.textContent = `播放中：${p.epName}（Safari 原生 HLS）`;
     } else {
-      msg.textContent = 'HLS.js 两个 CDN 都加载失败，且浏览器不支持原生 HLS，无法播放 M3U8。';
+      msg.textContent = 'HLS.js 两个 CDN 都加载失败，且浏览器不支持原生 HLS。' +
+        '请切到「① 原生直连」，或检查网络后点「重试播放」。';
     }
   }
 

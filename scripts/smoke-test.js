@@ -14,6 +14,7 @@ const { parsePlayUrl, normalizeItem, normalizeResponse } = require('../lib/vod-f
 const vodHandler = require('../api/vod');
 const sourcesHandler = require('../api/sources');
 const playlistHandler = require('../api/playlist');
+const fragmentHandler = require('../api/fragment');
 
 const SAMPLE = {
   code: 1, msg: '数据列表', page: 1, pagecount: 3, total: 42,
@@ -275,6 +276,78 @@ function setBase(path) {
         '/api/playlist?url=' + encodeURIComponent('https://cdn.example.com/a.m3u8'));
       assert.strictEqual(r.body.code, 'PLAYLIST_INVALID_M3U8');
       assert.ok(r.body.detail.excerpt.includes('Access Denied'));
+    } finally { global.fetch = realFetch; }
+  });
+
+  console.log('\n[7] 分片同源代理（解决「新标签能播 / 页面内 fragLoadError」）');
+  check('全代理清单：分片 / 子清单 / KEY 都改写成同源路径', () => {
+    const out = playlistHandler.absolutizeProxied(PLAYLIST, 'https://cdn.example.com/hls/index.m3u8');
+    assert.ok(out.includes('/api/fragment?url='), '分片应走本站');
+    assert.ok(out.includes('URI="/api/fragment?url='), 'KEY 也应走本站');
+    const uriLines = out.split('\n').filter((l) => l.trim() && !l.startsWith('#'));
+    assert.strictEqual(uriLines.length, 3, '3 个分片都要被处理');
+    assert.ok(uriLines.every((l) => l.startsWith('/api/fragment?url=')),
+      '不能残留任何裸的相对/绝对分片地址');
+    assert.ok(out.includes('#EXT-X-ENDLIST'), '注释指令应保留');
+  });
+  check('全代理清单：嵌套 M3U8 子清单走 playlist 而非 fragment', () => {
+    const master = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nlow/index.m3u8\n#EXT-X-ENDLIST';
+    const out = playlistHandler.absolutizeProxied(master, 'https://cdn.example.com/hls/master.m3u8');
+    assert.ok(out.includes('/api/playlist?proxyFrag=1&url='), '子清单应递归代理');
+    assert.ok(!out.includes('/api/fragment?url='), '子清单不能被当成分片');
+  });
+  check('Content-Type 按分片扩展名正确设置', () => {
+    assert.strictEqual(fragmentHandler.contentTypeOf('/a/seg.ts'), 'video/mp2t');
+    assert.strictEqual(fragmentHandler.contentTypeOf('/a/seg.m4s'), 'video/mp4');
+  });
+  await checkAsync('proxyFrag=1 时 /api/playlist 输出的是同源化清单', async () => {
+    const realFetch = global.fetch;
+    global.fetch = async () => ({ ok: true, status: 200,
+      url: 'https://cdn.example.com/hls/index.m3u8', text: async () => PLAYLIST });
+    try {
+      const r = await callText(playlistHandler,
+        '/api/playlist?proxyFrag=1&url=' + encodeURIComponent('https://cdn.example.com/hls/index.m3u8'));
+      assert.strictEqual(r.status, 200);
+      assert.ok(r.text.includes('/api/fragment?url='));
+      const uriLines = r.text.split('\n').filter((l) => l.trim() && !l.startsWith('#'));
+      assert.ok(uriLines.length > 0 && uriLines.every((l) => l.startsWith('/api/fragment?url=')),
+        '相对分片应全部被重写成同源路径');
+    } finally { global.fetch = realFetch; }
+  });
+  await checkAsync('分片代理：成功返回二进制 + CORS + 私有缓存', async () => {
+    const realFetch = global.fetch;
+    const payload = Buffer.from([0x47, 0x01, 0x02, 0x03]);
+    global.fetch = async () => ({ ok: true, status: 200,
+      headers: { get: () => null }, arrayBuffer: async () => payload });
+    try {
+      const r = await callText(fragmentHandler,
+        '/api/fragment?url=' + encodeURIComponent('https://cdn.example.com/hls/seg001.ts'));
+      assert.strictEqual(r.status, 200);
+      assert.strictEqual(r.headers['Access-Control-Allow-Origin'], '*');
+      assert.strictEqual(r.headers['Content-Type'], 'video/mp2t');
+      assert.ok(r.headers['Cache-Control'].includes('private'), '带 token 的分片不能进共享缓存');
+      assert.strictEqual(r.headers['Content-Length'], '4');
+    } finally { global.fetch = realFetch; }
+  });
+  await checkAsync('分片代理：403 / 超过 4MB / 内网 / 误传清单 都有明确错误码', async () => {
+    const a = await call(fragmentHandler, '/api/fragment?url=' + encodeURIComponent('http://127.0.0.1/a.ts'));
+    assert.strictEqual(a.body.code, 'FORBIDDEN_HOST');
+    const b = await call(fragmentHandler, '/api/fragment?url=' + encodeURIComponent('https://cdn.example.com/a.m3u8'));
+    assert.strictEqual(b.body.code, 'USE_PLAYLIST');
+
+    const realFetch = global.fetch;
+    global.fetch = async () => ({ ok: false, status: 403, headers: { get: () => null } });
+    try {
+      const c = await call(fragmentHandler, '/api/fragment?url=' + encodeURIComponent('https://cdn.example.com/a.ts'));
+      assert.strictEqual(c.body.code, 'FRAGMENT_403');
+    } finally { global.fetch = realFetch; }
+
+    global.fetch = async () => ({ ok: true, status: 200,
+      headers: { get: () => String(5 * 1024 * 1024) }, arrayBuffer: async () => Buffer.alloc(0) });
+    try {
+      const d = await call(fragmentHandler, '/api/fragment?url=' + encodeURIComponent('https://cdn.example.com/a.ts'));
+      assert.strictEqual(d.body.code, 'FRAGMENT_TOO_LARGE');
+      assert.ok(d.body.detail.hint.includes('原生直连'), '要给用户可执行的下一步');
     } finally { global.fetch = realFetch; }
   });
 

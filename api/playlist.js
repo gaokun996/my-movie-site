@@ -61,23 +61,56 @@ function isForbiddenHost(hostname) {
  * 只处理非注释行，保留 #EXT 指令、属性列表与加密 KEY URI 原样结构。
  */
 function absolutize(text, baseUrl) {
+  return rewritePlaylist(text, baseUrl, (absolute) => absolute);
+}
+
+/**
+ * 把清单里所有分片 / 子清单 / KEY 都改写成「本站同源」路径。
+ *
+ * 为什么需要：浏览器用 <video src> 或新标签直接导航加载媒体走 no-cors，
+ * 不需要 CORS 头；但 HLS.js 用 XHR/fetch 取 .ts 分片是跨域请求，
+ * 上游不返回 Access-Control-Allow-Origin 就会被静默拦掉，
+ * 表现正是「清单拿到了、一直缓冲、fragLoadError」。
+ * 全部改走同源后，浏览器与上游之间不再有跨域请求，CORS 问题从根上消失。
+ *
+ * 注意用根相对路径 /api/... ：清单本身的 URL 是 /api/playlist?...，
+ * 写成 api/... 会被解析成 /api/api/... 而 404。
+ */
+function absolutizeProxied(text, baseUrl) {
+  return rewritePlaylist(text, baseUrl, (absolute) => {
+    if (/\.m3u8(\?|$)/i.test(absolute)) {
+      return '/api/playlist?proxyFrag=1&url=' + encodeURIComponent(absolute);
+    }
+    return '/api/fragment?url=' + encodeURIComponent(absolute);
+  });
+}
+
+/** 共用的逐行重写器：先把 URI 解析成绝对地址，再交给 rewriter 决定最终形式 */
+function rewritePlaylist(text, baseUrl, rewriter) {
   const base = new URL(baseUrl);
+  const resolve = (uri) => {
+    if (/^(data:|skd:|blob:)/i.test(uri)) return null;
+    if (/^\/api\//i.test(uri)) return uri;      // 已经是本站同源路径，别套娃
+    try { return new URL(uri, base).toString(); }
+    catch (e) { return null; }
+  };
+  const apply = (uri) => {
+    const abs = resolve(uri);
+    if (!abs) return uri;
+    try { return rewriter(abs); } catch (e) { return abs; }
+  };
+
   return String(text).split(/\r?\n/).map((line) => {
     const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) {
-      // #EXT-X-KEY 里的 URI="..." 也可能是相对路径
+    if (!trimmed) return line;
+    if (trimmed.startsWith('#')) {
+      // #EXT-X-KEY / MAP / SESSION-KEY 的 URI 也可能是相对路径，同样要处理
       if (/^#EXT-X-(KEY|MAP|SESSION-KEY)/i.test(trimmed)) {
-        return line.replace(/URI="([^"]+)"/gi, (full, uri) => {
-          if (/^(https?:|data:|skd:)/i.test(uri)) return full;
-          try { return `URI="${new URL(uri, base).toString()}"`; }
-          catch (e) { return full; }
-        });
+        return line.replace(/URI="([^"]+)"/gi, (full, uri) => `URI="${apply(uri)}"`);
       }
       return line;
     }
-    if (/^(https?:|\/\/|data:)/i.test(trimmed)) return line;
-    try { return new URL(trimmed, base).toString(); }
-    catch (e) { return line; }
+    return apply(trimmed);
   }).join('\n');
 }
 
@@ -157,7 +190,10 @@ async function handler(req, res) {
     }
 
     const finalUrl = upstream.url || target.toString();
-    return sendText(res, 200, absolutize(text, finalUrl), true);
+    const body = q.get('proxyFrag') === '1'
+      ? absolutizeProxied(text, finalUrl)
+      : absolutize(text, finalUrl);
+    return sendText(res, 200, body, true);
 
   } catch (e) {
     clearTimeout(timer);
@@ -174,4 +210,5 @@ async function handler(req, res) {
 module.exports = handler;
 module.exports.handler = handler;
 module.exports.absolutize = absolutize;
+module.exports.absolutizeProxied = absolutizeProxied;
 module.exports.isForbiddenHost = isForbiddenHost;
