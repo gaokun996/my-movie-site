@@ -193,6 +193,16 @@
 
   .player-pane { display:none; margin-top:20px; }
   .player-pane.show { display:block; }
+  .diag { margin-top:10px; padding:11px 13px; border-radius:8px;
+    background:#101826; border:1px solid #2a3649; }
+  .diag-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; font-size:12px; margin-bottom:7px; }
+  .diag-label { color:var(--dim2); flex-shrink:0; min-width:68px; }
+  .diag-url { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:11px;
+    color:#9fc0ff; word-break:break-all; flex:1; min-width:180px; }
+  .radio { color:var(--dim); display:flex; align-items:center; gap:5px; cursor:pointer; }
+  .radio input { accent-color:var(--accent); }
+  .diag-acts { display:flex; gap:8px; flex-wrap:wrap; margin-top:4px; }
+  .diag-acts .mini { font-size:11px; padding:5px 10px; }
   .skip-toast { position:fixed; left:50%; bottom:34px; transform:translateX(-50%); z-index:70;
     display:none; padding:9px 17px; border-radius:999px; font-size:12px;
     background:rgba(28,36,50,.96); border:1px solid #3a475e; color:#dce6f8;
@@ -282,6 +292,22 @@
       <div class="player-pane" id="playerPane">
         <div class="player-box"><video id="video" controls playsinline></video></div>
         <div id="playmsg" class="playmsg"></div>
+        <div class="diag">
+          <div class="diag-row">
+            <span class="diag-label">播放地址</span>
+            <span class="diag-url" id="diagUrl" title="">—</span>
+          </div>
+          <div class="diag-row">
+            <span class="diag-label">取清单方式</span>
+            <label class="radio"><input type="radio" name="fetchMode" value="proxy" checked> 同源代理（推荐，解决 CORS）</label>
+            <label class="radio"><input type="radio" name="fetchMode" value="direct"> 浏览器直连</label>
+          </div>
+          <div class="diag-acts">
+            <button class="mini" id="diagCopy">复制地址</button>
+            <button class="mini" id="diagOpen">新标签打开</button>
+            <button class="mini" id="diagRetry">重试播放</button>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -333,7 +359,8 @@
 
   const state = {
     source:'', sourceName:'', sources:[], cls:'', kw:'', pg:1,
-    pagecount:1, total:0, items:[], sort:'default', current:null, lineIndex:0, skipDone:false
+    pagecount:1, total:0, items:[], sort:'default', current:null, lineIndex:0,
+    skipDone:false, lastPlay:null, viaProxy:true, fragOk:false
   };
   let hls = null, hlsPromise = null;
 
@@ -555,37 +582,117 @@
     v.addEventListener('timeupdate', v._skipHandler);
   }
 
-  async function playEpisode(url, epName, item) {
+  function proxyUrlOf(raw) { return '/api/playlist?url=' + encodeURIComponent(raw); }
+
+  /** 读回 /api/playlist 的结构化错误，给出比 HLS.js 原生报错更准的原因 */
+  async function diagnoseProxy() {
+    if (!state.lastPlay || !state.viaProxy) return '';
+    try {
+      const r = await fetch(proxyUrlOf(state.lastPlay.url), { headers:{ Accept:'application/json' } });
+      const ct = r.headers.get('content-type') || '';
+      if (!ct.includes('json')) return '';
+      const d = await r.json();
+      if (d.ok === false) {
+        const bits = [`[${d.code}] ${d.message || ''}`];
+        if (d.detail && d.detail.httpStatus) bits.push(`HTTP ${d.detail.httpStatus}`);
+        if (d.detail && d.detail.excerpt) bits.push(`片段: ${d.detail.excerpt}`);
+        return bits.join(' · ');
+      }
+    } catch (e) {}
+    return '';
+  }
+
+  function hlsErrorText(data, extra) {
+    const type = String((data && data.type) || '');
+    const det = String((data && data.details) || '');
+    const code = data && data.response && data.response.code;
+    const head = code ? `HTTP ${code}` : (det || '未知错误');
+    let layer, hint;
+    if (/manifest/i.test(type + det)) {
+      layer = '① 播放清单层';
+      hint = extra ||
+        'M3U8 清单没取到。若用直连，多半是 CORS 缺少 Access-Control-Allow-Origin；' +
+        '若用代理仍失败，多半是清单域名有 Referer / 地区 / 时效校验。勾选上面的「同源代理」再试。';
+    } else if (/key/i.test(type + det)) {
+      layer = '② 解密密钥层';
+      hint = '取 #EXT-X-KEY 密钥失败，该流有加密鉴权，同源代理清单无法提供凭证。';
+    } else if (/level|frag|load/i.test(type + det)) {
+      layer = '③ 视频分片层';
+      hint = '清单拿到了，但 .ts / .m4s 分片被拒绝。常见于防盗链：Referer 白名单、' +
+             'IP 绑定、token 时效。这一层在纯前端零成本架构里无法稳定绕过。';
+    } else {
+      layer = '播放层'; hint = extra || '视频流不可达或格式不受支持。';
+    }
+    return `${layer}失败（${head}）：${hint}`;
+  }
+
+  async function startPlayback() {
+    const p = state.lastPlay;
+    if (!p) return;
     const v = $('video'), msg = $('playmsg');
-    $('playerPane').classList.add('show');
-    msg.textContent = `正在加载：${epName} …`;
+    state.viaProxy = document.querySelector('input[name="fetchMode"]:checked').value === 'proxy';
+    state.fragOk = false;
     destroyHls();
     bindSkipToast(v);
-    const isM3u8 = /\.m3u8(\?|$)/i.test(url);
+    v.load();
+
+    const isM3u8 = /\.m3u8(\?|$)/i.test(p.url);
+    const loadUrl = (isM3u8 && state.viaProxy) ? proxyUrlOf(p.url) : p.url;
+    msg.textContent = `正在加载：${p.epName} …${isM3u8 ? (state.viaProxy ? '（清单走同源代理）' : '（清单直连）') : '（直链视频）'}`;
+
     if (!isM3u8) {
-      v.src = url;
+      v.src = p.url;
       v.play().catch(() => { msg.textContent = '已载入，点击播放按钮开始。'; });
-      msg.textContent = `播放中：${epName}（直链）`;
-    } else {
-      const ok = await loadHls();
-      if (ok && window.Hls && window.Hls.isSupported()) {
-        hls = new window.Hls({ enableWorker:true });
-        hls.loadSource(url); hls.attachMedia(v);
-        hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
-          msg.textContent = `播放中：${epName}`;
-          v.play().catch(() => { msg.textContent = '已就绪，点击播放按钮开始。'; });
-        });
-        hls.on(window.Hls.Events.ERROR, (_e, data) => {
-          if (data && data.fatal) msg.textContent = '播放失败：视频流不可达、已过期或被拒绝，请换一集 / 换线路。';
-        });
-      } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
-        v.src = url; v.play().catch(() => {});
-        msg.textContent = `播放中：${epName}（原生 HLS）`;
-      } else {
-        msg.textContent = 'HLS.js 两个 CDN 都加载失败，且浏览器不支持原生 HLS，无法播放 M3U8。';
-        return;
-      }
+      msg.textContent = `播放中：${p.epName}（直链）`;
+      return;
     }
+
+    const ok = await loadHls();
+    if (ok && window.Hls && window.Hls.isSupported()) {
+      const H = window.Hls;
+      hls = new H({
+        enableWorker: true,
+        manifestLoadingTimeOut: 8000, manifestLoadingMaxRetry: 1, manifestLoadingRetryDelay: 500,
+        levelLoadingTimeOut: 8000,     levelLoadingMaxRetry: 1,
+        fragLoadingTimeOut: 15000,     fragLoadingMaxRetry: 1,
+        // 不设置 xhrSetup：不伪造任何第三方 Referer / Origin / 凭证。
+      });
+      hls.on(H.Events.MANIFEST_LOADING, () => {
+        msg.textContent = '① 正在取播放清单（M3U8）…';
+      });
+      hls.on(H.Events.MANIFEST_PARSED, (_e, data) => {
+        const n = (data && data.levels && data.levels.length) || 1;
+        msg.textContent = `② 清单就绪（${n} 个清晰度），正在取视频分片…`;
+        v.play().catch(() => { msg.textContent += ' 已就绪，点击播放按钮开始。'; });
+      });
+      hls.on(H.Events.FRAG_LOADED, () => {
+        if (!state.fragOk) { state.fragOk = true; msg.textContent = `③ 分片已加载，播放中：${p.epName}`; }
+      });
+      hls.on(H.Events.ERROR, async (_e, data) => {
+        const fatal = data && data.fatal;
+        if (!fatal) return;
+        const extra = await diagnoseProxy();
+        msg.textContent = hlsErrorText(data, extra);
+        try { hls.destroy(); } catch (e) {}
+        hls = null;
+      });
+      // 先绑定媒体再喂清单，避免个别版本在 attach 前拿不到 video 元素
+      hls.attachMedia(v);
+      hls.loadSource(loadUrl);
+    } else if (v.canPlayType('application/vnd.apple.mpegurl')) {
+      v.src = loadUrl; v.play().catch(() => {});
+      msg.textContent = `播放中：${p.epName}（Safari 原生 HLS）`;
+    } else {
+      msg.textContent = 'HLS.js 两个 CDN 都加载失败，且浏览器不支持原生 HLS，无法播放 M3U8。';
+    }
+  }
+
+  async function playEpisode(url, epName, item) {
+    state.lastPlay = { url, epName, item };
+    $('playerPane').classList.add('show');
+    const du = $('diagUrl');
+    du.textContent = url; du.title = url;
+    await startPlayback();
     saveHistory({ vod_id:item.vod_id, name:item.vod_name, pic:item.vod_pic,
       epName, url, ts:Date.now(), sources:item.play_sources || [],
       meta:{ vod_year:item.vod_year, vod_area:item.vod_area, vod_class:item.vod_class,
@@ -753,6 +860,28 @@
     $('settingsOverlay').classList.add('hidden');
     $('sourceMenu').classList.remove('open');
     if (!$('playOverlay').classList.contains('hidden')) $('playClose').click();
+  });
+
+  $('diagCopy').onclick = async () => {
+    const u = state.lastPlay && state.lastPlay.url;
+    if (!u) return;
+    const btn = $('diagCopy');
+    try { await navigator.clipboard.writeText(u); }
+    catch (e) {
+      const t = document.createElement('textarea'); t.value = u;
+      document.body.appendChild(t); t.select(); document.execCommand('copy'); t.remove();
+    }
+    btn.textContent = '✓ 已复制';
+    setTimeout(() => { btn.textContent = '复制地址'; }, 1600);
+  };
+  $('diagOpen').onclick = () => {
+    if (state.lastPlay) window.open(state.lastPlay.url, '_blank', 'noopener,noreferrer');
+  };
+  $('diagRetry').onclick = () => startPlayback();
+  document.querySelectorAll('input[name="fetchMode"]').forEach((r) => {
+    r.onchange = () => {
+      if (state.lastPlay && $('playerPane').classList.contains('show')) startPlayback();
+    };
   });
 
   $('skipToast').onclick = () => {

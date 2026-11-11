@@ -13,6 +13,7 @@ const assert = require('assert');
 const { parsePlayUrl, normalizeItem, normalizeResponse } = require('../lib/vod-format');
 const vodHandler = require('../api/vod');
 const sourcesHandler = require('../api/sources');
+const playlistHandler = require('../api/playlist');
 
 const SAMPLE = {
   code: 1, msg: '数据列表', page: 1, pagecount: 3, total: 42,
@@ -48,6 +49,13 @@ async function call(handler, url) {
   const res = mockRes();
   await handler({ url, method: 'GET' }, res);
   return { status: res.statusCode, body: JSON.parse(res.body), headers: res.headers };
+}
+async function callText(handler, url) {
+  const res = mockRes();
+  await handler({ url, method: 'GET' }, res);
+  const ct = res.headers['Content-Type'] || '';
+  return { status: res.statusCode, text: res.body, headers: res.headers,
+    body: ct.includes('json') ? JSON.parse(res.body) : null };
 }
 
 let lastUpstreamUrl = '';
@@ -197,6 +205,77 @@ function setBase(path) {
     assert.strictEqual(r.body.stage, 'parse');
     assert.strictEqual(r.body.code, 'INVALID_JSON');
     assert.ok(r.body.detail.excerpt.includes('Access Denied'));
+  });
+
+  console.log('\n[6] M3U8 播放清单同源代理');
+  const PLAYLIST = [
+    '#EXTM3U',
+    '#EXT-X-VERSION:3',
+    '#EXT-X-KEY:METHOD=AES-128,URI="key.key"',
+    '#EXTINF:10.0,',
+    'seg001.ts',
+    '#EXTINF:10.0,',
+    '/abs/seg002.ts',
+    '#EXTINF:10.0,',
+    'https://other.cdn.example.com/seg003.ts',
+    '#EXT-X-ENDLIST'
+  ].join('\n');
+
+  check('相对分片 / 绝对分片 / KEY URI 全部重写正确', () => {
+    const out = playlistHandler.absolutize(PLAYLIST, 'https://cdn.example.com/hls/index.m3u8');
+    assert.ok(out.includes('URI="https://cdn.example.com/hls/key.key"'), 'KEY 相对路径应绝对化');
+    assert.ok(out.includes('https://cdn.example.com/hls/seg001.ts'), '相对分片应绝对化');
+    assert.ok(out.includes('https://cdn.example.com/abs/seg002.ts'), '根相对分片应绝对化');
+    assert.ok(out.includes('https://other.cdn.example.com/seg003.ts'), '绝对分片不能被改');
+    assert.ok(out.includes('#EXT-X-ENDLIST'), '注释指令应保留');
+  });
+  check('SSRF 防护：拒绝内网，放行公网', () => {
+    ['localhost', '127.0.0.1', '10.0.0.1', '172.16.0.1', '192.168.1.1', '169.254.1.1', '::1']
+      .forEach((h) => assert.strictEqual(playlistHandler.isForbiddenHost(h), true, h));
+    ['cdn.example.com', '104.21.34.57'].forEach((h) =>
+      assert.strictEqual(playlistHandler.isForbiddenHost(h), false, h));
+  });
+  await checkAsync('缺参数 / 非 M3U8 / 内网地址都被挡住（不当开放代理）', async () => {
+    const a = await call(playlistHandler, '/api/playlist');
+    assert.strictEqual(a.body.code, 'NO_URL');
+    const b = await call(playlistHandler, '/api/playlist?url=' + encodeURIComponent('https://cdn.example.com/a.mp4'));
+    assert.strictEqual(b.body.code, 'NOT_PLAYLIST');
+    const c = await call(playlistHandler, '/api/playlist?url=' + encodeURIComponent('http://127.0.0.1/x.m3u8'));
+    assert.strictEqual(c.body.code, 'FORBIDDEN_HOST');
+  });
+  await checkAsync('成功代理：返回清单文本 + CORS + 相对分片已绝对化', async () => {
+    const realFetch = global.fetch;
+    global.fetch = async () => ({
+      ok: true, status: 200, url: 'https://cdn.example.com/hls/index.m3u8',
+      text: async () => PLAYLIST,
+    });
+    try {
+      const r = await callText(playlistHandler,
+        '/api/playlist?url=' + encodeURIComponent('https://cdn.example.com/hls/index.m3u8'));
+      assert.strictEqual(r.status, 200);
+      assert.ok((r.headers['Content-Type'] || '').includes('mpegurl'));
+      assert.strictEqual(r.headers['Access-Control-Allow-Origin'], '*');
+      assert.ok(r.text.includes('https://cdn.example.com/hls/seg001.ts'));
+      assert.ok(r.headers['Cache-Control'].includes('s-maxage'));
+    } finally { global.fetch = realFetch; }
+  });
+  await checkAsync('上游 403 / 返回 HTML 拦截页 → 可诊断错误码', async () => {
+    const realFetch = global.fetch;
+    global.fetch = async () => ({ ok: false, status: 403, url: '', text: async () => '' });
+    try {
+      const r = await call(playlistHandler,
+        '/api/playlist?url=' + encodeURIComponent('https://cdn.example.com/a.m3u8'));
+      assert.strictEqual(r.body.code, 'PLAYLIST_403');
+      assert.strictEqual(r.body.detail.httpStatus, 403);
+    } finally { global.fetch = realFetch; }
+
+    global.fetch = async () => ({ ok: true, status: 200, url: '', text: async () => '<html>Access Denied</html>' });
+    try {
+      const r = await call(playlistHandler,
+        '/api/playlist?url=' + encodeURIComponent('https://cdn.example.com/a.m3u8'));
+      assert.strictEqual(r.body.code, 'PLAYLIST_INVALID_M3U8');
+      assert.ok(r.body.detail.excerpt.includes('Access Denied'));
+    } finally { global.fetch = realFetch; }
   });
 
   server.close();
