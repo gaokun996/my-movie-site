@@ -60,7 +60,7 @@
     </div>
 
     <div class="grid" id="results">
-      <div class="tip">正在加载推荐影视资源...</div>
+      <div class="tip">正在连接资源接口...</div>
     </div>
   </div>
 
@@ -72,59 +72,40 @@
       const kw = document.getElementById('keyword').value.trim();
       const resultsDiv = document.getElementById('results');
       
-      resultsDiv.innerHTML = '<div class="tip">正在请求接口，请稍候...</div>';
+      resultsDiv.innerHTML = '<div class="tip">正在从接口拉取海报数据...</div>';
 
-      // 构建请求的目标地址（如果没有输入关键字，默认请求最新列表）
       const targetUrl = `${api}?ac=detail${kw ? '&wd=' + encodeURIComponent(kw) : ''}`;
       
-      // 使用多重跨域代理策略轮询，确保 100% 能拿到数据
-      const proxyUrls = [
-        `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
-        `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`,
-        targetUrl // 直接请求（若资源站支持CORS）
-      ];
+      // 使用稳定可靠的 CORS 代理穿透跨域限制
+      const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`;
 
-      let data = null;
-      for (let url of proxyUrls) {
-        try {
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 6000); // 6秒超时自动跳过
-          
-          const res = await fetch(url, { signal: controller.signal });
-          clearTimeout(timeoutId);
-          
-          if (res.ok) {
-            const json = await res.json();
-            if (json && json.list) {
-              data = json;
-              break;
-            }
-          }
-        } catch (err) {
-          continue;
-        }
-      }
-
-      if (!data || !data.list || data.list.length === 0) {
-        resultsDiv.innerHTML = '<div class="tip">当前接口未返回数据，请尝试在左上角切换其他资源接口（如量子、极速资源）。</div>';
-        return;
-      }
-
-      resultsDiv.innerHTML = '';
-      data.list.forEach(item => {
-        const card = document.createElement('div');
-        card.className = 'card';
-        card.onclick = () => playVod(item);
+      try {
+        const res = await fetch(proxyUrl);
+        const data = await res.json();
         
-        card.innerHTML = `
-          <img class="poster" src="${item.vod_pic || ''}" alt="${item.vod_name}" onerror="this.src='https://via.placeholder.com/160x220?text=暂无海报'">
-          <div class="card-info">
-            <div class="title" title="${item.vod_name}">${item.vod_name}</div>
-            <div class="note">${item.vod_remarks || '高清'}</div>
-          </div>
-        `;
-        resultsDiv.appendChild(card);
-      });
+        if (!data || !data.list || data.list.length === 0) {
+          resultsDiv.innerHTML = '<div class="tip">该接口当前未搜到相关内容，请换个关键词或切换上方其他资源接口。</div>';
+          return;
+        }
+
+        resultsDiv.innerHTML = '';
+        data.list.forEach(item => {
+          const card = document.createElement('div');
+          card.className = 'card';
+          card.onclick = () => playVod(item);
+          
+          card.innerHTML = `
+            <img class="poster" src="${item.vod_pic || ''}" alt="${item.vod_name}" onerror="this.src='https://via.placeholder.com/160x220?text=暂无海报'">
+            <div class="card-info">
+              <div class="title" title="${item.vod_name}">${item.vod_name}</div>
+              <div class="note">${item.vod_remarks || '高清'}</div>
+            </div>
+          `;
+          resultsDiv.appendChild(card);
+        });
+      } catch (e) {
+        resultsDiv.innerHTML = '<div class="tip">跨域请求被拦截，请尝试在左上角切换其他接口。</div>';
+      }
     }
 
     function playVod(item) {
@@ -165,7 +146,6 @@
       section.style.display = 'none';
     }
 
-    // 页面加载完成后自动触发搜索
     window.onload = () => {
       searchVod();
     };
