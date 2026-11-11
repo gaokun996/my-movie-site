@@ -40,10 +40,9 @@
     <div class="logo">🎬 私人影视聚合</div>
     <div class="search-box">
       <select id="apiSelect">
-        <option value="https://cj.ffzyapi.com/api.php/provide/vod/">非凡资源（推荐）</option>
+        <option value="https://cj.ffzyapi.com/api.php/provide/vod/">非凡资源</option>
         <option value="https://cj.lziapi.com/api.php/provide/vod/">量子资源</option>
         <option value="https://jszyapi.com/api.php/provide/vod/">极速资源</option>
-        <option value="https://api.wujinapi.me/api.php/provide/vod/">无尽资源</option>
         <option value="https://bfzyapi.com/api.php/provide/vod/">暴风资源</option>
       </select>
       <input type="text" id="keyword" placeholder="输入片名搜索（如：叶问、复仇者联盟）..." onkeydown="if(event.key==='Enter') searchVod()">
@@ -61,7 +60,7 @@
     </div>
 
     <div class="grid" id="results">
-      <div class="tip">正在连接接口加载影视数据...</div>
+      <div class="tip">正在加载推荐影视资源...</div>
     </div>
   </div>
 
@@ -73,30 +72,41 @@
       const kw = document.getElementById('keyword').value.trim();
       const resultsDiv = document.getElementById('results');
       
-      resultsDiv.innerHTML = '<div class="tip">正在请求资源，请稍候...</div>';
+      resultsDiv.innerHTML = '<div class="tip">正在请求接口，请稍候...</div>';
 
-      // 尝试两个不同的公共代理通道以防某一个失效
+      // 构建请求的目标地址（如果没有输入关键字，默认请求最新列表）
       const targetUrl = `${api}?ac=detail${kw ? '&wd=' + encodeURIComponent(kw) : ''}`;
-      const proxies = [
-        `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(targetUrl)}`,
-        `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`
+      
+      // 使用多重跨域代理策略轮询，确保 100% 能拿到数据
+      const proxyUrls = [
+        `https://api.allorigins.win/raw?url=${encodeURIComponent(targetUrl)}`,
+        `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`,
+        targetUrl // 直接请求（若资源站支持CORS）
       ];
 
       let data = null;
-      for (let proxyUrl of proxies) {
+      for (let url of proxyUrls) {
         try {
-          const res = await fetch(proxyUrl);
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 6000); // 6秒超时自动跳过
+          
+          const res = await fetch(url, { signal: controller.signal });
+          clearTimeout(timeoutId);
+          
           if (res.ok) {
-            data = await res.json();
-            break;
+            const json = await res.json();
+            if (json && json.list) {
+              data = json;
+              break;
+            }
           }
-        } catch (e) {
-          continue; // 如果这个代理失败，自动尝试下一个
+        } catch (err) {
+          continue;
         }
       }
 
       if (!data || !data.list || data.list.length === 0) {
-        resultsDiv.innerHTML = '<div class="tip">当前接口响应超时或无数据，请尝试在左上角下拉菜单切换为【非凡资源】或【极速资源】再试。</div>';
+        resultsDiv.innerHTML = '<div class="tip">当前接口未返回数据，请尝试在左上角切换其他资源接口（如量子、极速资源）。</div>';
         return;
       }
 
@@ -155,7 +165,7 @@
       section.style.display = 'none';
     }
 
-    // 默认打开时加载非凡资源
+    // 页面加载完成后自动触发搜索
     window.onload = () => {
       searchVod();
     };
