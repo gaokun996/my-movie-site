@@ -9,8 +9,9 @@
  * 关键设计：失败时返回带 stage / code 的结构化错误，而不是笼统地"切换接口重试"。
  */
 
-const { loadSources, getSource } = require('../lib/sources');
+const { loadSources, getSource, DEMO_BASE } = require('../lib/sources');
 const { normalizeResponse } = require('../lib/vod-format');
+const { buildDemoPayload } = require('../lib/demo-data');
 
 const ALLOWED_AC = new Set(['videolist', 'detail', 'class', 'list']);
 const PASS_THROUGH = ['wd', 'pg', 't', 'ids', 'at', 'h', 'limit'];
@@ -43,7 +44,7 @@ module.exports = async function handler(req, res) {
   const sources = loadSources();
   if (!sources.length) {
     return error(res, 'config', 'NO_SOURCE',
-      '尚未配置资源接口。请在 Vercel → Project Settings → Environment Variables 添加 VOD_SOURCES_JSON（或 VOD_API_BASE），然后重新部署。',
+      '数据源列表为空。正常情况下会自动回退到内置演示数据；若出现此提示，请检查 lib/sources.js 是否完整上传。',
       { hint: '参见随项目附带的 sources.example.json 与 README.md' });
   }
 
@@ -58,6 +59,26 @@ module.exports = async function handler(req, res) {
   // ac=detail&ids= 仍保留为按 id 查单条。
   let ac = ALLOWED_AC.has(q.get('ac')) ? q.get('ac') : 'videolist';
   if (ac === 'detail' && q.get('wd') && !q.get('ids')) ac = 'videolist';
+
+  // 零配置演示模式：完全不出网，直接返回内置数据，复用同一套标准化逻辑。
+  // 配置自有授权接口后本分支不会命中。
+  if (src.base === DEMO_BASE) {
+    const payload = buildDemoPayload({
+      ac,
+      wd: q.get('wd'),
+      pg: q.get('pg'),
+      t: q.get('t'),
+      ids: q.get('ids'),
+    });
+    return send(res, 200, {
+      ok: true,
+      stage: 'ok',
+      demo: true,
+      source: { id: src.id, name: src.name },
+      ac,
+      ...normalizeResponse(payload),
+    }, true);
+  }
 
   let target;
   try {
